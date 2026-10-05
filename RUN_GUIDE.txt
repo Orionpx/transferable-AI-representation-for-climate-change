@@ -1,0 +1,364 @@
+PRITHVI TRANSFERABILITY RESEARCH REPOSITORY
+============================================
+
+Purpose
+-------
+This repository evaluates the transferability, data efficiency, and robustness
+of the NASA-IBM Prithvi EO 2.0 100M-TL foundation model on flood segmentation.
+It also compares Prithvi against a standard U-Net baseline and tests transfer to
+EuroSAT land-cover classification.
+
+The intended hardware is an NVIDIA RTX 3060 with 12 GB VRAM and 32 GB RAM.
+The training configuration uses batch size 4, 16-bit mixed precision, gradient
+accumulation, and gradient clipping to reduce memory pressure.
+
+1. Repository layout
+--------------------
+
+configs/sen1floods.yaml
+    Main experiment configuration: paths, bands, learning rates, epochs, and
+    memory-related settings.
+
+src/dataset.py
+    Rasterio and Albumentations loader for the Sen1Floods11 GeoTIFF files.
+    It reads the official split CSV files and pairs S2Hand imagery with
+    LabelHand masks.
+
+src/model.py
+    Terratorch Prithvi backbone, segmentation decoder, staged freezing, and
+    Dice plus cross-entropy loss.
+
+train.py
+    Original Prithvi flood-segmentation training entry point.
+
+evaluate_and_baseline.py
+    Held-out Prithvi evaluation, visualization grids, and six-channel U-Net
+    baseline training.
+
+data_efficiency_runner.py
+    Repeats Prithvi and U-Net training using 10%, 25%, and 50% of the train
+    split.
+
+transfer_eurosat.py
+    Fine-tunes the same Prithvi backbone for ten-class EuroSAT classification.
+
+robustness_test.py
+    Measures clean versus corrupted test performance using CoarseDropout and
+    Gaussian noise.
+
+data/sen1floods11/
+    Downloaded Sen1Floods11 v1.1 dataset.
+
+outputs/
+    Checkpoints, evaluation images, and experiment CSV files.
+
+2. Python environment
+---------------------
+
+Use Python 3.12 for this project. Python 3.14 installed a CPU-only Torch wheel
+in the original environment, which made the RTX 3060 unavailable. The working
+CUDA environment is .venv312.
+
+Check the GPU driver:
+
+    nvidia-smi
+
+Create the environment if it does not exist:
+
+    py -3.12 -m venv .venv312
+
+Activate it in PowerShell:
+
+    .\.venv312\Scripts\Activate.ps1
+
+Install CUDA-enabled PyTorch. The CUDA index is important because the default
+CPU wheel will not use the RTX 3060:
+
+    python -m pip install --upgrade pip
+    python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+Install the remaining dependencies:
+
+    python -m pip install lightning terratorch rasterio geopandas segmentation-models-pytorch albumentations pyyaml scikit-learn matplotlib
+
+Verify CUDA before training:
+
+    python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+Expected result includes:
+
+    2.14.1+cu126 12.6 True NVIDIA GeForce RTX 3060
+
+Why this matters:
+    The repository requests GPU acceleration and 16-bit AMP. If
+    torch.cuda.is_available() is False, Lightning will silently fall back to
+    CPU when the code is allowed to do so, making training extremely slow.
+
+3. Dataset setup
+-----------------
+
+The official Sen1Floods11 v1.1 bucket is approximately 34 GB because it
+contains Sentinel-1, Sentinel-2, hand labels, weak labels, catalogs, and
+checkpoints.
+
+The loader uses these paths:
+
+    data/sen1floods11/data/flood_events/HandLabeled/S2Hand/
+    data/sen1floods11/data/flood_events/HandLabeled/LabelHand/
+    data/sen1floods11/splits/flood_handlabeled/
+
+The split CSV files list S1Hand names. The loader changes each S1Hand stem to
+S2Hand and pairs it with the LabelHand mask.
+
+The six model channels are selected from the 13-band Sentinel-2 file:
+
+    B2, B3, B4, B8, B11, B12
+
+Their one-based Rasterio indices are:
+
+    [2, 3, 4, 8, 12, 13]
+
+If the dataset is missing, download the official v1.1 bucket with:
+
+    New-Item -ItemType Directory -Force .\data\sen1floods11
+    gsutil -m rsync -r gs://sen1floods11/v1.1/ .\data\sen1floods11\
+
+Verify the data before training:
+
+    python -c "import yaml; from src.dataset import build_dataloaders; c=yaml.safe_load(open('configs/sen1floods.yaml')); tr,va=build_dataloaders(c); print(len(tr.dataset), len(va.dataset), next(iter(tr))['image'].shape)"
+
+Expected shapes are approximately:
+
+    252 training samples
+    89 validation samples
+    [4, 6, 256, 256] image batch
+
+4. Run the original Prithvi flood task
+--------------------------------------
+
+    python train.py --config configs/sen1floods.yaml
+
+Why:
+    This trains the main foundation-model segmentation experiment. The model
+    freezes the Prithvi backbone for the first five epochs, then unfreezes it
+    for end-to-end fine-tuning. Gradient accumulation of four batches gives an
+    effective batch size of 16 while the physical batch remains 4.
+
+AMP and accumulation are controlled by:
+
+    precision: 16-mixed
+    batch_size: 4
+    gradient_accumulation_steps: 4
+
+The best checkpoint is written to:
+
+    outputs/checkpoints/
+
+The current successful run produced:
+
+    outputs/checkpoints/epoch=24-step=400.ckpt
+    validation IoU approximately 0.676 during training
+
+5. Evaluate Prithvi on the held-out test split
+-----------------------------------------------
+
+    python evaluate_and_baseline.py --mode evaluate \
+        --config configs/sen1floods.yaml \
+        --checkpoint outputs/checkpoints/epoch=24-step=400.ckpt \
+        --output-dir outputs/evaluation
+
+Why:
+    Validation performance is used for model selection. The held-out test split
+    is needed for an unbiased final result.
+
+Outputs:
+
+    outputs/evaluation/test_metrics.yaml
+    outputs/evaluation/example_0000.png
+    outputs/evaluation/example_0001.png
+    ...
+
+Each image is a 1x3 grid containing RGB input, ground truth, and prediction.
+The RGB visualization uses B4, B3, and B2. The model still receives all six
+selected channels.
+
+Observed held-out result from the successful run:
+
+    mean IoU: 0.6483
+    F1 score: 0.7675
+
+6. Train and evaluate the U-Net baseline
+-----------------------------------------
+
+    python evaluate_and_baseline.py --mode baseline \
+        --config configs/sen1floods.yaml \
+        --output-dir outputs/baseline
+
+Why:
+    A standard baseline is required to determine whether Prithvi provides a
+    useful transfer advantage over a conventional segmentation architecture.
+    The baseline is a U-Net with a ResNet-34 encoder trained from scratch.
+    encoder_weights=None prevents ImageNet initialization from confounding the
+    comparison.
+
+The first convolution is configured with in_channels=6 because the input is
+six-channel Sentinel-2 data.
+
+The best baseline checkpoint is saved under:
+
+    outputs/baseline/checkpoints/
+
+A successful run reached approximately:
+
+    validation IoU: 0.729 at its best observed epoch
+    validation F1: 0.838 at its best observed epoch
+
+Use identical train and validation splits when comparing Prithvi and U-Net.
+
+7. Robustness experiment
+------------------------
+
+    python robustness_test.py \
+        --config configs/sen1floods.yaml \
+        --checkpoint outputs/checkpoints/epoch=24-step=400.ckpt \
+        --output-csv outputs/robustness/results.csv
+
+Why:
+    Climate and remote-sensing data can contain missing pixels, cloud-like
+    gaps, and sensor noise. The script evaluates the same model on clean data
+    and on synthetic corruptions.
+
+Corruptions:
+
+    CoarseDropout: simulates missing regions or cloud cover.
+    Gaussian noise: simulates sensor measurement errors.
+
+Observed result:
+
+    clean IoU:     0.6483
+    corrupted IoU: 0.5066
+    IoU change:   -0.1417
+
+Interpret the IoU change as robustness degradation. More negative values mean
+stronger sensitivity to corruption.
+
+8. Data-efficiency experiment
+-----------------------------
+
+    python data_efficiency_runner.py \
+        --config configs/sen1floods.yaml \
+        --fractions 0.10 0.25 0.50 \
+        --max-epochs 10 \
+        --output-csv outputs/data_efficiency/results.csv
+
+Why:
+    This tests whether Prithvi reaches useful validation IoU with fewer labeled
+    examples than a model trained from scratch.
+
+The script runs six conditions:
+
+    Prithvi at 10%, 25%, and 50%
+    U-Net at 10%, 25%, and 50%
+
+The output CSV contains:
+
+    model,fraction,val_mean_iou
+
+For a fair comparison:
+
+    - Keep the random seed fixed.
+    - Keep validation data unchanged.
+    - Keep image size, batch size, AMP, and gradient accumulation unchanged.
+    - Use the same maximum epochs or report the same training budget.
+
+9. EuroSAT transfer experiment
+------------------------------
+
+    python transfer_eurosat.py \
+        --config configs/sen1floods.yaml \
+        --data-dir data/eurosat \
+        --output-dir outputs/eurosat \
+        --max-epochs 20
+
+Why:
+    Flood segmentation and land-cover classification are different tasks. A
+    Prithvi classification head tests whether the pretrained representation is
+    useful outside the original flood task.
+
+The torchvision EuroSAT dataset is RGB. This script repeats RGB into six input
+channels so it can use the same six-channel Prithvi backbone contract. This is
+an RGB transfer experiment and should be described honestly; it is not a
+replacement for true multispectral EuroSAT bands.
+
+The ten-class classifier uses a global pooled Prithvi feature and a linear
+classification head. The first epochs freeze the backbone, then the backbone
+is unfrozen using the same staged strategy.
+
+Outputs:
+
+    outputs/eurosat/checkpoints/
+    Lightning logs under the configured output directory.
+
+10. Recommended research reporting
+-----------------------------------
+
+Report the following table for the professor:
+
+    Method       Task              Split       IoU       F1/Accuracy
+    Prithvi      Flood segmentation Test        ...       ...
+    U-Net        Flood segmentation Test        ...       ...
+    Prithvi      Flood robustness   Corrupted   ...       ...
+    Prithvi      EuroSAT            Validation  ...       ...
+
+For data efficiency, report a second table:
+
+    Method       10% IoU    25% IoU    50% IoU    100% IoU
+    Prithvi      ...        ...        ...        0.6483 test
+    U-Net        ...        ...        ...        ...
+
+Do not compare validation IoU from one model directly against test IoU from
+another model. Keep the split and metric definition explicit.
+
+11. Common problems
+-------------------
+
+CUDA is False:
+    You installed CPU-only Torch or selected the wrong interpreter. Activate
+    .venv312 and rerun the CUDA verification command.
+
+Prithvi registry error:
+    Use prithvi_eo_v2_100_tl for Terratorch 1.2.13. The non-TL name is present
+    in internal configuration but is not registered as a backbone constructor
+    in that release.
+
+Out-of-memory error:
+    Reduce batch_size to 2, keep gradient_accumulation_steps at 8, reduce
+    image_size to 224, or close other GPU applications. Keep precision at
+    16-mixed.
+
+Missing image or mask:
+    Check that the full v1.1 dataset was downloaded and that the paths in
+    configs/sen1floods.yaml point to S2Hand, LabelHand, and the split CSVs.
+
+No checkpoint:
+    Confirm that train.py or the baseline command completed and inspect
+    outputs/checkpoints or outputs/baseline/checkpoints.
+
+EuroSAT download failure:
+    Check internet access and rerun transfer_eurosat.py. EuroSAT is downloaded
+    by torchvision into the selected data directory.
+
+12. Reproducibility
+-------------------
+
+The configuration uses seed 42. Preserve these values in reported runs:
+
+    seed: 42
+    image_size: 256
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    precision: 16-mixed
+
+Record the Python version, Torch version, CUDA version, Terratorch version,
+checkpoint filename, split files, and any changed hyperparameters with every
+reported experiment.

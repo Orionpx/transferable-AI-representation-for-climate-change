@@ -1,0 +1,55 @@
+seed: 42
+paths:
+  data_root: data/sen1floods11
+  image_dir: data/flood_events/HandLabeled/S2Hand
+  mask_dir: data/flood_events/HandLabeled/LabelHand
+  train_split: splits/flood_handlabeled/flood_train_data.csv
+  val_split: splits/flood_handlabeled/flood_valid_data.csv
+  checkpoint_dir: outputs/checkpoints
+bands:
+  names:
+  - B02
+  - B03
+  - B04
+  - B08
+  - B11
+  - B12
+  indices:
+  - 2
+  - 3
+  - 4
+  - 8
+  - 12
+  - 13
+  mean:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  std:
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - 1.0
+model:
+  backbone_name: prithvi_eo_v2_100_tl
+  pretrained: true
+  num_classes: 2
+  freeze_backbone_epochs: 5
+  decoder_channels: 256
+training:
+  max_epochs: 50
+  batch_size: 4
+  num_workers: 0
+  learning_rate: 0.0001
+  backbone_learning_rate: 1.0e-05
+  weight_decay: 0.0001
+  gradient_accumulation_steps: 4
+  precision: 16-mixed
+  early_stopping_patience: 8
+  image_size: 256
+  log_every_n_steps: 10
